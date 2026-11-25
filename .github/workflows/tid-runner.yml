@@ -17,11 +17,17 @@ on:
     - cron: "40 22 * * 1-5"   # oi       (18:40 EDT / 17:40 EST)
     - cron: "40 23 * * 1-5"   # oi       (19:40 EDT / 18:40 EST)
     - cron: "17 14 * * 1-5"   # contest1 (10:17 EDT)
-    - cron: "17 15 * * 1-5"   # contest1 (10:17 EST)
+    - cron: "47 14 * * 1-5"   # contest1 (10:47 EDT, retry)
+    - cron: "17 15 * * 1-5"   # contest1 (10:17 EST / 11:17 EDT)
+    - cron: "47 15 * * 1-5"   # contest1 (10:47 EST, retry)
     - cron: "47 16 * * 1-5"   # contest2 (12:47 EDT)
-    - cron: "47 17 * * 1-5"   # contest2 (12:47 EST)
+    - cron: "17 17 * * 1-5"   # contest2 (13:17 EDT, retry)
+    - cron: "47 17 * * 1-5"   # contest2 (12:47 EST / 13:47 EDT)
+    - cron: "17 18 * * 1-5"   # contest2 (13:17 EST, retry)
     - cron: "17 19 * * 1-5"   # contest3 (15:17 EDT)
-    - cron: "17 20 * * 1-5"   # contest3 (15:17 EST)
+    - cron: "47 19 * * 1-5"   # contest3 (15:47 EDT, retry)
+    - cron: "17 20 * * 1-5"   # contest3 (15:17 EST / 16:17 EDT)
+    - cron: "47 20 * * 1-5"   # contest3 (15:47 EST, retry)
   workflow_dispatch:
     inputs:
       scan:
@@ -74,9 +80,9 @@ jobs:
             "5 16 * * 1-5"|"5 17 * * 1-5"|"5 18 * * 1-5") scan=midday ;;
             "5 19 * * 1-5"|"35 19 * * 1-5"|"5 20 * * 1-5") scan=afternoon ;;
             "40 22 * * 1-5"|"40 23 * * 1-5") scan=oi ;;
-            "17 14 * * 1-5"|"17 15 * * 1-5") scan=contest1 ;;
-            "47 16 * * 1-5"|"47 17 * * 1-5") scan=contest2 ;;
-            "17 19 * * 1-5"|"17 20 * * 1-5") scan=contest3 ;;
+            "17 14 * * 1-5"|"47 14 * * 1-5"|"17 15 * * 1-5"|"47 15 * * 1-5") scan=contest1 ;;
+            "47 16 * * 1-5"|"17 17 * * 1-5"|"47 17 * * 1-5"|"17 18 * * 1-5") scan=contest2 ;;
+            "17 19 * * 1-5"|"47 19 * * 1-5"|"17 20 * * 1-5"|"47 20 * * 1-5") scan=contest3 ;;
             *) echo "unknown schedule '$SCHEDULE'"; exit 2 ;;
           esac
           echo "args=--scan $scan --window" >> "$GITHUB_OUTPUT"

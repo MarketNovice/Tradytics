@@ -23,7 +23,7 @@ import postgres from "npm:postgres@3.4.4";
 
 type ScanType = "morning" | "midday" | "afternoon" | "oi" | "contest1" | "contest2" | "contest3";
 const SCANS: ScanType[] = ["morning", "midday", "afternoon", "oi", "contest1", "contest2", "contest3"];
-const RUNNER_VERSION = "tid-runner/0.2.1";
+const RUNNER_VERSION = "tid-runner/0.2.2";
 const SOURCE = "Tradytics";
 const BASE = Deno.env.get("TRADYTICS_BASE_URL") ?? "https://tradytics.com/api/public/v1";
 const RPM = Number(Deno.env.get("TRADYTICS_RPM") ?? "8");
@@ -38,10 +38,11 @@ const WINDOWS: Record<ScanType, [number, number]> = {
   midday: [11 * 60 + 30, 13 * 60 + 45],
   afternoon: [14 * 60 + 30, 16 * 60],
   oi: [17 * 60, 23 * 60 + 30],
-  // Agent contest (TID-4.0): entry and mark captures right after each submission window closes.
-  contest1: [10 * 60 + 15, 10 * 60 + 55],
-  contest2: [12 * 60 + 45, 13 * 60 + 25],
-  contest3: [15 * 60 + 15, 15 * 60 + 55],
+  // Agent contest (TID-4.0): entry and mark captures after each submission window closes. 90 minutes wide,
+  // because GitHub's scheduled runs often start 20-40 minutes late; two cron attempts per window.
+  contest1: [10 * 60 + 15, 11 * 60 + 45],
+  contest2: [12 * 60 + 45, 14 * 60 + 15],
+  contest3: [15 * 60 + 15, 16 * 60 + 45],
 };
 
 const UNIVERSE = ("NVDA,MU,SNDK,AMD,TSLA,JNJ,AMZN,AAPL,AVGO,VLO,BA,META,INTC,MSFT,GOOGL,NBIS,CRWD,MSTR,CRWV,RDDT," +

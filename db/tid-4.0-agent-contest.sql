@@ -392,9 +392,9 @@ end; $$;
 
 -- Contest scans for the heartbeat; required only once the contest starts.
 insert into tid.tid_hb_expected_scans (scan_type, deadline_et, required, note) values
-  ('contest1', '11:00', false, 'Contest entry/mark capture after window w1'),
-  ('contest2', '13:30', false, 'Contest entry/mark capture after window w2'),
-  ('contest3', '16:00', false, 'Contest entry/mark capture after window w3')
+  ('contest1', '11:50', false, 'Contest entry/mark capture after window w1'),
+  ('contest2', '14:20', false, 'Contest entry/mark capture after window w2'),
+  ('contest3', '16:50', false, 'Contest entry/mark capture after window w3')
 on conflict (scan_type) do nothing;
 
 -- ------------------------------------------------------------------ owner views

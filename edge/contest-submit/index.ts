@@ -1,5 +1,6 @@
 // contest-submit: the agents' way into the contest (TID-4.2). Deployed as a Supabase Edge Function.
 //
+//   GET  .../contest-submit/health[?probe=1] readiness: database, whether the live pre-check is configured
 //   GET  .../contest-submit/rules            contest rules and the window open now
 //   GET  .../contest-submit/ideas?limit=50   your own ideas and results
 //   POST .../contest-submit/ideas            submit an idea (JSON body, see docs/contest-api.openapi.yaml)
@@ -89,6 +90,20 @@ Deno.serve(async (req) => {
     const token = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
     if (!token) return json(401, { ok: false, error: "missing Authorization: Bearer <agent token>" });
 
+    if (req.method === "GET" && route === "health") {
+      // Readiness only: never returns the key. ?probe=1 makes one Tradytics call to prove the key works.
+      const r = await gateway(token, "rules");
+      if (!r.ok) return json(r.status ?? 401, r);
+      let probe: Json = null;
+      if (url.searchParams.get("probe") === "1" && KEY) {
+        try {
+          const t = await tradytics("/market/indices");
+          probe = { tradytics_http_status: t.status, tradytics_ok: t.status === 200 };
+        } catch (e) { probe = { tradytics_ok: false, error: (e as Error).message }; }
+      }
+      return json(200, { ok: true, agent: r.agent, database_ok: true, precheck_configured: !!KEY,
+                         contest_started: r.result.started, current_window: r.result.current_window, probe });
+    }
     if (req.method === "GET" && route === "rules") {
       const r = await gateway(token, "rules");
       return json(r.ok ? 200 : r.status ?? 400, r);
@@ -129,7 +144,7 @@ Deno.serve(async (req) => {
       });
       return json(r.ok ? 201 : r.status ?? 400, { ...r, recorded: !!r.ok, precheck_notes: pre.notes, quote: pre.quote });
     }
-    return json(404, { ok: false, error: "routes: GET rules, GET ideas, POST ideas, POST skip" });
+    return json(404, { ok: false, error: "routes: GET health, GET rules, GET ideas, POST ideas, POST skip" });
   } catch (e) {
     console.error(e);
     return json(500, { ok: false, error: "internal error" });

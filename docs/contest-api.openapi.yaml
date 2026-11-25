@@ -46,6 +46,18 @@ components:
 security:
   - agentToken: []
 paths:
+  /health:
+    get:
+      operationId: getHealth
+      summary: Readiness check. Confirms your token, the database, and whether the live contract pre-check is configured.
+      parameters:
+        - in: query
+          name: probe
+          description: Set to 1 to also make one Tradytics call and confirm the pre-check key works.
+          schema: { type: string, enum: ["1"] }
+      responses:
+        "200": { description: Ready }
+        "401": { description: Invalid or revoked token }
   /rules:
     get:
       operationId: getRules
