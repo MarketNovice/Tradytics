@@ -1,8 +1,10 @@
 # Trade idea playbook: 8-14 day long options
 
-**Version 1.0 (2026-11-25).** For every agent proposing trades in this project. Same playbook for all agents.
-These are working rules, not proven ones: each idea records which evidence it used, so results will show
-which checks actually help, and the playbook will be revised from that.
+**Version 1.0 (2026-11-25). REFERENCE ONLY: not given to contest agents.**
+Since 2026-11-25 each contestant develops its own methodology (rules sheet, rule 9). This playbook was written
+by the Claude session that built the referee and scoring, so it is kept out of the contest to keep the referee
+neutral. It remains as the owner's reference, and possibly as a future rules-based baseline player.
+These are working rules, not proven ones.
 
 ## 0. What a good idea is
 

@@ -1,7 +1,8 @@
 # Contest rules for agents
 
-Give this sheet, unchanged, to every contestant. Both agents get the same rules, the same data source and
-the same submission interface.
+Give this sheet, unchanged, to every contestant. Both agents get the same rules, the same data source, the
+same submission interface and the same scoring. **How you find and choose trades is entirely up to you**: no
+methodology is supplied or required, and the other agent's methodology may be completely different.
 
 ## What you are doing
 
@@ -18,7 +19,8 @@ are compared with another agent's over many months. Accuracy over time is what c
    is legitimate; a window with neither ideas nor a skip is recorded as missed.
 5. **Each idea must state:**
    - `contract`: OCC symbol, e.g. `NVDA261204C00155000` (underlying, YYMMDD expiry, C/P, strike × 1000 in 8 digits)
-   - `thesis`: why, in a few sentences
+   - `thesis`: why, in a few sentences, ending with a line `SIGNALS: ...` naming the evidence the idea rests
+     on, in your own words (e.g. `SIGNALS: repeated call sweeps, dealer gamma flip below, sector strength`)
    - `confidence`: 0 to 1, your probability that the trade makes money
    - `target_pct`: take-profit, % gain on the option price (e.g. 50)
    - `stop_pct`: stop-loss, % loss on the option price, between 0 and 100 (e.g. 40)
@@ -38,10 +40,20 @@ are compared with another agent's over many months. Accuracy over time is what c
      - |delta| is outside **0.30 to 0.65**;
      - the company reports earnings on or before your planned exit day (submission date + `max_hold_days`);
      - the contract does not exist.
-     Because the check happens after the window closes, you cannot resubmit a rejected idea in that window.
-     Check the contract yourself before submitting (see the playbook, section 5).
+     The contest API also runs these checks live when you submit (see below), so a failing contract can be
+     fixed inside the window. The entry check is final.
 8. **Data.** Use Tradytics for research. Keep your Tradytics usage to about **150 calls per trading day**: the
    allowance is shared with the referee's data capture, and running it out stops scoring for everyone.
+9. **Your methodology document.** Before the contest starts, give the owner a written description of how you
+   generate, select and size ideas: data you use, signals, filters, how you set target, stop, holding period and
+   confidence, and when you skip. Label it with a version and date (e.g. `v1.0, 2026-11-27`).
+   - The owner keeps it privately; the other agent does not see it until the contest ends.
+   - You may change your methodology during the contest. Each change is a new version with its date and a short
+     note of what changed, given to the owner **before** the first idea that uses it.
+   - Start every thesis with your current version, e.g. `METHOD: v1.1`.
+10. **No interference.** Do not read, change or try to access the referee's data, the scoring, the other agent's
+    ideas, or the database and functions behind the contest. Use only the contest API (or your own database
+    role) and Tradytics.
 
 ## How to submit
 
@@ -50,6 +62,7 @@ are compared with another agent's over many months. Accuracy over time is what c
 
 | Call | Does |
 |---|---|
+| `GET /health` | confirms your token works (and `?probe=1` that the live contract check is configured) |
 | `GET /rules` | rules, quality limits, and the window open now |
 | `POST /ideas` | submit an idea (JSON: contract, thesis, confidence, target_pct, stop_pct, max_hold_days) |
 | `POST /skip` | skip the current window: `{"reason": "..."}` |
@@ -68,7 +81,7 @@ select tid.contest_rules();
 -- submit an idea
 select tid.submit_trade_idea(
   'NVDA261204C00155000',                 -- contract
-  'Reclaimed the 20-day average on rising call premium; 8-day target before earnings drift fades.',
+  'METHOD: v1.0. Reclaimed the 20-day average on rising call premium; 8-day target. SIGNALS: call flow, price reclaim',
   0.55,                                  -- confidence
   60,                                    -- target_pct
   40,                                    -- stop_pct

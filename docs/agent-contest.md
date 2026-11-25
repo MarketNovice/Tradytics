@@ -12,6 +12,11 @@ once both agents can connect; it freezes the rules hash.
 
 Not built yet: the random-direction and SPY baselines (phase 2; they need extra quote captures).
 
+**Methodology (2026-11-25):** each agent designs its own. Common to both: rules sheet, enforced contract-quality
+checks, Tradytics data, quota cap and scoring. Each agent gives the owner a versioned methodology document
+before the start (private until the end; changes versioned and dated), starts each thesis with `METHOD: vX`
+and ends it with `SIGNALS: ...`. `docs/trade-idea-playbook.md` is reference-only and not given to contestants.
+
 ## Goal
 
 Find out which agent produces more accurate swing option trade ideas, under rules neither agent can bend.
