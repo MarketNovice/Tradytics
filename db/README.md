@@ -11,7 +11,14 @@ Supabase GitHub integration does not pick them up. Apply each one by hand after 
 
 | `tid-runner-role.sql` | **Applied** 2026-11-25 (`tid_runner_role`) | Login role `tid_runner` for the runner and watchdog, created without a password. Writes scan runs, ingestion tables and market bars; reads the calendar; executes the TID functions. Cannot delete, read snapshot/version/OI/watchdog tables, or touch other tables. Verified as the role in a rolled-back transaction. |
 
-Order: 3.2, then 3.3, then 2.12, then the role. All are idempotent.
+| `tid-4.0-agent-contest.sql` | **Applied** 2026-11-25 (`tid_4_0_agent_contest`), **not started** | Agent contest: append-only ideas, fills, marks and results; `submit_trade_idea`/`skip_window`/`my_trade_ideas` for agents; `contest_prepare`/`contest_record_quote` scoring for the runner; `contest_start` (owner); roles `tid_agent_chatgpt`, `tid_agent_claude` (no passwords yet); scoreboard and paired views. See `docs/agent-contest.md`. |
+| (hb_check update) | **Applied** 2026-11-25 (`tid_3_3_1_per_checker_dedup`) | Each watchdog deduplicates only its own reports. |
+
+Order: 3.2, 3.3, 2.12, runner role, 4.0. All are idempotent.
+
+Contest tests: `test/test-tid-4.0-contest.sql` (5 of 5 passed on a fresh database). A live run of the
+`contest1` scan against a local database filled two real contracts at the ask from the first capture and
+marked them from the next.
 
 ## TID-2.12 verification (protocol §13)
 

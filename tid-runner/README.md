@@ -1,7 +1,7 @@
 # tid-runner
 
 Deterministic scheduled ingestion. Replaces the chat automations as the thing that makes data exist.
-**Status: 0.1.1.** Dry-run and live-tested against the vendor API and a local replica of the Supabase schema
+**Status: 0.2.0.** Dry-run and live-tested against the vendor API and a local replica of the Supabase schema
 (see `DRYRUN-2026-11-24.md`, `SCHEMA-CHECK-2026-11-24.md`, `../db/README.md`). Not yet run from GitHub Actions.
 
 ## Scans
@@ -12,6 +12,7 @@ Deterministic scheduled ingestion. Replaces the chat automations as the thing th
 | `midday` | 11:30-13:45 | quotes, indices, breadth, sectors, cohort flow (15m) | 5 |
 | `afternoon` | 14:30-16:00 | same as midday | 5 |
 | `oi` | 17:00-23:30 | OI chain only (evening capture, for TID-2.12 timing verification) | OI |
+| `contest1`-`contest3` | 10:15-10:55, 12:45-13:25, 15:15-15:55 | Agent contest: entry quotes for ideas from the window that just closed, marks for open trades (`/options/contracts/{contract}`) | one per contract |
 
 OI chain = `/options/chain` per symbol, `max_dte` = `OI_MAX_DTE` (default 60), 1,000 contracts per page.
 Each page is stored as a TID-3.2 snapshot in the `chain_oi_v1` projection (contract, OI, volume, delta);

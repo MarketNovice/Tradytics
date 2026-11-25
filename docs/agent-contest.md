@@ -1,6 +1,16 @@
 # Agent contest: ChatGPT vs Claude on swing option trades
 
-**Status:** DESIGN DRAFT. Nothing here is built yet. Decisions marked **[D1]**–**[D6]** are the owner's.
+**Status:** BUILT 2026-11-25, **not started**. Owner chose the recommended option for every decision:
+D1 long calls/puts only; D2 up to 3 ideas per window; D3 buy at the ask, sell at the bid; D4 direction-accuracy
+verdict at 400 and return verdict at 1,000 closed trades per agent, no winner declared earlier; D5 Claude plays
+from a separate task with only its agent role; D6 each agent keeps to about 150 Tradytics calls a day (not
+enforceable by the database; watch the runner for quota aborts).
+
+Built: `db/tid-4.0-agent-contest.sql` (applied as `tid_4_0_agent_contest`), runner scans `contest1-3`
+(tid-runner 0.2.0), rules sheet `docs/contest-agent-rules.md`. Start with `select tid.contest_start('note');`
+once both agents can connect; it freezes the rules hash.
+
+Not built yet: the random-direction and SPY baselines (phase 2; they need extra quote captures).
 
 ## Goal
 

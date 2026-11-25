@@ -25,6 +25,9 @@ begin
   assert (select count(*) from jsonb_array_elements(r->'findings') f where f->>'code' = 'scan_missing') = 8, 'codes wrong';
   r2 := tid.hb_check('test', false, '2026-11-25 22:00 America/New_York');
   assert jsonb_array_length(r2->'findings') = 8 and jsonb_array_length(r2->'new_findings') = 0, 'repeat should not be new';
+  -- a different watchdog is not silenced by the first one's reports
+  r2 := tid.hb_check('other-watchdog', false, '2026-11-25 22:00 America/New_York');
+  assert jsonb_array_length(r2->'new_findings') = 8, 'second checker should get its own new findings';
   c := tid.hb_check('test', true, '2026-11-25 22:00 America/New_York');
   assert (select count(*) from jsonb_array_elements(c->'new_findings') f where f->>'code' = 'canary') = 1, 'canary not new';
   perform tid.hb_ack_canary((c->>'watchdog_run_id')::bigint, 'test', 'received');

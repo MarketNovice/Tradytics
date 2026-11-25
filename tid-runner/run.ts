@@ -6,7 +6,7 @@
 // and verifies each batch by reading it back.
 //
 // Usage:
-//   deno run -A run.ts --scan morning|midday|afternoon|oi|auto [--window] [--dry-run] [--force]
+//   deno run -A run.ts --scan morning|midday|afternoon|oi|contest1|contest2|contest3|auto [--window] [--dry-run] [--force]
 //
 //   --window   refuse to run outside the scan's ET window (used by the scheduled workflow, so the
 //              cron entry for the other DST offset exits without doing anything)
@@ -21,9 +21,9 @@
 
 import postgres from "npm:postgres@3.4.4";
 
-type ScanType = "morning" | "midday" | "afternoon" | "oi";
-const SCANS: ScanType[] = ["morning", "midday", "afternoon", "oi"];
-const RUNNER_VERSION = "tid-runner/0.1.1";
+type ScanType = "morning" | "midday" | "afternoon" | "oi" | "contest1" | "contest2" | "contest3";
+const SCANS: ScanType[] = ["morning", "midday", "afternoon", "oi", "contest1", "contest2", "contest3"];
+const RUNNER_VERSION = "tid-runner/0.2.0";
 const SOURCE = "Tradytics";
 const BASE = Deno.env.get("TRADYTICS_BASE_URL") ?? "https://tradytics.com/api/public/v1";
 const RPM = Number(Deno.env.get("TRADYTICS_RPM") ?? "8");
@@ -38,6 +38,10 @@ const WINDOWS: Record<ScanType, [number, number]> = {
   midday: [11 * 60 + 30, 13 * 60 + 45],
   afternoon: [14 * 60 + 30, 16 * 60],
   oi: [17 * 60, 23 * 60 + 30],
+  // Agent contest (TID-4.0): entry and mark captures right after each submission window closes.
+  contest1: [10 * 60 + 15, 10 * 60 + 55],
+  contest2: [12 * 60 + 45, 13 * 60 + 25],
+  contest3: [15 * 60 + 15, 15 * 60 + 55],
 };
 
 const UNIVERSE = ("NVDA,MU,SNDK,AMD,TSLA,JNJ,AMZN,AAPL,AVGO,VLO,BA,META,INTC,MSFT,GOOGL,NBIS,CRWD,MSTR,CRWV,RDDT," +
@@ -109,14 +113,15 @@ function retryAfterSeconds(h: string | null, fallback: number): number {
 // deno-lint-ignore no-explicit-any
 type Json = any;
 interface ApiResult { json: Json; url: string; rawSha: string; asOf: string | null; snapshotId: number | null }
-interface ApiOpts { project?: (json: Json) => Json }
+interface ApiOpts { project?: (json: Json) => Json; endpoint?: string; symbol?: string; contractKey?: string }
 
-async function snap(path: string, params: Json, r: ApiResult | null, reason: string | null, receivedAt: string | null, payload?: Json): Promise<number | null> {
+async function snap(path: string, params: Json, r: ApiResult | null, reason: string | null, receivedAt: string | null, payload?: Json, opts: ApiOpts = {}): Promise<number | null> {
   if (!sql || !snapshotsOn) return null;
-  const sym = params.symbol && !String(params.symbol).includes(",") ? String(params.symbol) : null;
+  path = opts.endpoint ?? path;
+  const sym = opts.symbol ?? (params.symbol && !String(params.symbol).includes(",") ? String(params.symbol) : null);
   try {
     const row = (await sql`select tid.capture_snapshot(
-      ${"tradytics" + path}::text, ${sym}::text, null::text, ${sql.json(params)}::jsonb,
+      ${"tradytics" + path}::text, ${sym}::text, ${opts.contractKey ?? null}::text, ${sql.json(params)}::jsonb,
       ${r?.asOf ?? null}::timestamptz, ${r ? sql.json(payload ?? r.json) : null}::jsonb,
       ${r ? "complete" : "missing"}::text, ${reason}::text, ${r?.rawSha ?? null}::text,
       ${runId}::uuid, ${RUNNER_VERSION}::text, ${receivedAt}::timestamptz) as id`)[0];
@@ -143,13 +148,13 @@ async function api(path: string, params: Json, opts: ApiOpts = {}, attempt = 0):
     text = await res.text();
   } catch (e) {
     if (attempt < 2) { await sleep(3000 * (attempt + 1)); return api(path, params, opts, attempt + 1); }
-    await snap(path, clean, null, `network: ${(e as Error).message}`, new Date().toISOString());
+    await snap(path, clean, null, `network: ${(e as Error).message}`, new Date().toISOString(), undefined, opts);
     throw e;
   }
   const receivedAt = new Date().toISOString();
   if (res.status === 429) {
     if (/quota_exceeded/i.test(text)) {
-      await snap(path, clean, null, `quota_exceeded: ${text.slice(0, 200)}`, receivedAt);
+      await snap(path, clean, null, `quota_exceeded: ${text.slice(0, 200)}`, receivedAt, undefined, opts);
       throw new QuotaError(`daily quota exceeded (resets 00:00 UTC): ${text.slice(0, 300)}`);
     }
     if (attempt < 3) {
@@ -164,17 +169,17 @@ async function api(path: string, params: Json, opts: ApiOpts = {}, attempt = 0):
     return api(path, params, opts, attempt + 1);
   }
   if (!res.ok) {
-    await snap(path, clean, null, `http ${res.status}: ${text.slice(0, 200)}`, receivedAt);
+    await snap(path, clean, null, `http ${res.status}: ${text.slice(0, 200)}`, receivedAt, undefined, opts);
     throw new Error(`${path} -> HTTP ${res.status}: ${text.slice(0, 300)}`);
   }
   let json: Json;
   try { json = JSON.parse(text); }
   catch {
-    await snap(path, clean, null, `non-JSON 200 response: ${text.slice(0, 200)}`, receivedAt);
+    await snap(path, clean, null, `non-JSON 200 response: ${text.slice(0, 200)}`, receivedAt, undefined, opts);
     throw new Error(`${path} -> non-JSON 200 response`);
   }
   const out: ApiResult = { json, url: url.toString(), rawSha: await sha256(text), asOf: json?.meta?.as_of ?? null, snapshotId: null };
-  out.snapshotId = await snap(path, clean, out, null, receivedAt, opts.project ? opts.project(json) : undefined);
+  out.snapshotId = await snap(path, clean, out, null, receivedAt, opts.project ? opts.project(json) : undefined, opts);
   return out;
 }
 
@@ -413,6 +418,41 @@ function oiFeed(session: string, scan: ScanType): () => Promise<Built> {
   };
 }
 
+// TID-4.0 agent contest: quote every contract that needs an entry or a mark, store each quote as a snapshot,
+// and let tid.contest_record_quote fill, mark and close trades by the contest rules. Contract order is fixed
+// by a hash in contest_prepare, so neither agent's contracts are systematically quoted first.
+function contestFeed(session: string, scan: ScanType): () => Promise<Built> {
+  return async () => {
+    if (DRY || !sql) {
+      return { records: [], pages: 0, complete: true, more: false, error: null, asOf: null, meta: { endpoint: "/options/contracts", dry_run: true } };
+    }
+    if (!snapshotsOn) throw new Error("contest scoring requires TID-3.2 snapshots");
+    const due = await sql`select contract, purpose from tid.contest_prepare(now())`;
+    const records: Rec[] = []; const errors: string[] = []; const asOfs: string[] = [];
+    let pages = 0, filled = 0, closed = 0;
+    for (const d of due) {
+      const c = String(d.contract);
+      try {
+        const r = await api(`/options/contracts/${encodeURIComponent(c)}`, {},
+          { endpoint: "/options/contracts", symbol: c.slice(0, -15), contractKey: c });
+        pages++;
+        if (r.asOf) asOfs.push(r.asOf);
+        const res = (await sql`select tid.contest_record_quote(${r.snapshotId}::bigint, now()) as v`)[0].v;
+        filled += res.filled; closed += res.closed;
+        const q = r.json?.data ?? {};
+        records.push(rec(key("contest_quote", c, session, scan), { purpose: d.purpose, bid: q.bid, ask: q.ask,
+          updated_at: q.updated_at, underlying_price: q.underlying_price, snapshot_id: r.snapshotId, result: res },
+          c.slice(0, -15), q.updated_at ?? null, r.asOf));
+      } catch (e) {
+        if (e instanceof QuotaError) throw e;
+        errors.push(`${c}: ${(e as Error).message}`);
+      }
+    }
+    return { records, pages, complete: errors.length === 0, more: false, error: summarize(errors), asOf: asOfs.sort().pop() ?? null,
+      meta: { endpoint: "/options/contracts", contracts: due.length, filled, closed, failed: errors.length } };
+  };
+}
+
 function feedsFor(scan: ScanType, session: string): [string, () => Promise<Built>][] {
   const market: [string, () => Promise<Built>][] = [
     ["tradytics_symbol_quotes", quotesFeed()],
@@ -429,6 +469,7 @@ function feedsFor(scan: ScanType, session: string): [string, () => Promise<Built
     ];
     case "midday": case "afternoon": return [...market, ["tradytics_options_flow_timeline", cohortFlowFeed(session)]];
     case "oi": return [["tradytics_open_interest_chain", oiFeed(session, scan)]];
+    case "contest1": case "contest2": case "contest3": return [["tradytics_contest_quotes", contestFeed(session, scan)]];
   }
 }
 

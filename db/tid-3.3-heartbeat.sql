@@ -171,11 +171,12 @@ begin
     f := f || jsonb_build_object('code', 'canary', 'note', 'Test alert. Acknowledge with tid.hb_ack_canary.');
   end if;
 
-  -- A finding is new unless the same code/scan/session was reported in the last 7 days. Canaries are always new.
+  -- A finding is new unless THIS checker reported the same code/scan/session in the last 7 days, so one
+  -- watchdog's reports never silence another's alerts. Canaries are always new.
   for x in select value from jsonb_array_elements(f) loop
     if x->>'code' = 'canary' or not exists (
          select 1 from tid.tid_hb_watchdog_runs w, jsonb_array_elements(w.new_findings) old
-          where w.checked_at > p_now - interval '7 days' and not w.is_canary
+          where w.checked_at > p_now - interval '7 days' and not w.is_canary and w.checker = p_checker
             and old->>'code' = x->>'code'
             and coalesce(old->>'scan_type', '') = coalesce(x->>'scan_type', '')
             and coalesce(old->>'session', '') = coalesce(x->>'session', '')) then
