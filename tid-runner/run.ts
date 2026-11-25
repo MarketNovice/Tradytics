@@ -553,10 +553,28 @@ async function main(): Promise<number> {
   return quotaError ? 3 : allOk ? 0 : 1;
 }
 
+// Describes DATABASE_URL without revealing the password, to diagnose login failures.
+function describeDatabaseUrl(): string {
+  const raw = Deno.env.get("DATABASE_URL") ?? "";
+  try {
+    const u = new URL(raw.trim());
+    const pw = decodeURIComponent(u.password);
+    return `user=${decodeURIComponent(u.username)} host=${u.hostname} port=${u.port} db=${u.pathname.slice(1)} ` +
+      `password_length=${pw.length} password_is_48_hex=${/^[0-9a-f]{48}$/.test(pw)} ` +
+      `password_has_space_or_quote=${/[\s'"]/.test(pw)} url_has_outer_whitespace=${raw !== raw.trim()} ` +
+      `placeholder_left=${/PASSWORD|paste|YOUR-/i.test(pw)}`;
+  } catch {
+    return `DATABASE_URL is not a valid URL (length ${raw.length}, starts with "${raw.slice(0, 13)}")`;
+  }
+}
+
 let code: number;
 try { code = await main(); }
 catch (e) {
   console.error(`${e instanceof SetupError ? "SETUP ERROR" : "ERROR"}: ${(e as Error).message}`);
+  if (/password authentication|authentication failed|does not exist|ENOTFOUND|ECONNREFUSED/i.test((e as Error).message)) {
+    console.error(`DATABASE_URL check (password not shown): ${describeDatabaseUrl()}`);
+  }
   code = e instanceof SetupError ? 2 : 1;
 } finally {
   if (sql) await sql.end({ timeout: 5 });
