@@ -84,6 +84,10 @@ If the target needs a move larger than the options-implied expected move to that
 Use `get_option_contracts` `chain` with `min_dte=8`, `max_dte=14`, `type`, `min_delta`/`max_delta`,
 `min_open_interest`, then `contract` for the final quote.
 
+**Enforced in the contest** (an idea that fails is rejected at entry): spread above 15%, open interest below
+500, |delta| outside 0.30-0.65, earnings on or before the planned exit day, contract not listed. The tighter
+values below are the playbook's targets; the enforced limits are the floor.
+
 | Rule | Value | Why |
 |---|---|---|
 | Expiry | 8-14 calendar days (contest rule) | |

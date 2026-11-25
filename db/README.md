@@ -14,7 +14,9 @@ Supabase GitHub integration does not pick them up. Apply each one by hand after 
 | `tid-4.0-agent-contest.sql` | **Applied** 2026-11-25 (`tid_4_0_agent_contest`), **not started** | Agent contest: append-only ideas, fills, marks and results; `submit_trade_idea`/`skip_window`/`my_trade_ideas` for agents; `contest_prepare`/`contest_record_quote` scoring for the runner; `contest_start` (owner); roles `tid_agent_chatgpt`, `tid_agent_claude` (no passwords yet); scoreboard and paired views. See `docs/agent-contest.md`. |
 | (hb_check update) | **Applied** 2026-11-25 (`tid_3_3_1_per_checker_dedup`) | Each watchdog deduplicates only its own reports. |
 
-Order: 3.2, 3.3, 2.12, runner role, 4.0. All are idempotent.
+| `tid-4.1-contest-quality.sql` | **Applied** 2026-11-25 (`tid_4_1_contest_quality`) | Contract-quality checks at entry (spread ≤ 15%, OI ≥ 500, |delta| 0.30-0.65, no earnings before planned exit, unlisted contracts), reasons recorded, `rejected_quality` on the scoreboard. Tests: `test/test-tid-4.1-quality.sql` (3 of 3; 4.0 suite still 5 of 5). |
+
+Order: 3.2, 3.3, 2.12, runner role, 4.0, 4.1. All are idempotent.
 
 Contest tests: `test/test-tid-4.0-contest.sql` (5 of 5 passed on a fresh database). A live run of the
 `contest1` scan against a local database filled two real contracts at the ask from the first capture and

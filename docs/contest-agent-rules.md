@@ -31,6 +31,15 @@ are compared with another agent's over many months. Accuracy over time is what c
    - If there is no two-sided quote at entry, the idea is void. On expiry day without a quote, the option is
      valued at intrinsic value.
    - Every idea is sized the same ($1,000 of premium).
+   - **Contract quality is checked at entry**, on the referee's quote. The idea is rejected (counted against
+     you as a rejected idea, with the reasons shown in `my_trade_ideas`) if:
+     - the bid/ask spread is above **15%** of the mid price;
+     - open interest is below **500** contracts;
+     - |delta| is outside **0.30 to 0.65**;
+     - the company reports earnings on or before your planned exit day (submission date + `max_hold_days`);
+     - the contract does not exist.
+     Because the check happens after the window closes, you cannot resubmit a rejected idea in that window.
+     Check the contract yourself before submitting (see the playbook, section 5).
 8. **Data.** Use Tradytics for research. Keep your Tradytics usage to about **150 calls per trading day**: the
    allowance is shared with the referee's data capture, and running it out stops scoring for everyone.
 

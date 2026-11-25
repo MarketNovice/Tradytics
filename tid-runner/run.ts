@@ -23,7 +23,7 @@ import postgres from "npm:postgres@3.4.4";
 
 type ScanType = "morning" | "midday" | "afternoon" | "oi" | "contest1" | "contest2" | "contest3";
 const SCANS: ScanType[] = ["morning", "midday", "afternoon", "oi", "contest1", "contest2", "contest3"];
-const RUNNER_VERSION = "tid-runner/0.2.0";
+const RUNNER_VERSION = "tid-runner/0.2.1";
 const SOURCE = "Tradytics";
 const BASE = Deno.env.get("TRADYTICS_BASE_URL") ?? "https://tradytics.com/api/public/v1";
 const RPM = Number(Deno.env.get("TRADYTICS_RPM") ?? "8");
@@ -429,27 +429,53 @@ function contestFeed(session: string, scan: ScanType): () => Promise<Built> {
     if (!snapshotsOn) throw new Error("contest scoring requires TID-3.2 snapshots");
     const due = await sql`select contract, purpose from tid.contest_prepare(now())`;
     const records: Rec[] = []; const errors: string[] = []; const asOfs: string[] = [];
-    let pages = 0, filled = 0, closed = 0;
+    let pages = 0, filled = 0, closed = 0, rejected = 0;
+    // Next earnings date per underlying, for the entry quality check (TID-4.1). One call per underlying.
+    const earnings = new Map<string, { next: string | null; checked: boolean }>();
+    const nextEarnings = async (u: string) => {
+      if (earnings.has(u)) return earnings.get(u)!;
+      let v = { next: null as string | null, checked: false };
+      try {
+        const r = await api("/calendar/earnings", { symbol: u });
+        pages++;
+        const upcoming = rows(r.json).map((x) => String(x.date ?? "")).filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d) && d >= session).sort();
+        v = { next: upcoming[0] ?? null, checked: true };
+      } catch (e) {
+        if (e instanceof QuotaError) throw e;
+        errors.push(`earnings ${u}: ${(e as Error).message}`);
+      }
+      earnings.set(u, v);
+      return v;
+    };
     for (const d of due) {
       const c = String(d.contract);
       try {
+        const e = String(d.purpose).includes("entry") ? await nextEarnings(c.slice(0, -15)) : { next: null, checked: false };
         const r = await api(`/options/contracts/${encodeURIComponent(c)}`, {},
           { endpoint: "/options/contracts", symbol: c.slice(0, -15), contractKey: c });
         pages++;
         if (r.asOf) asOfs.push(r.asOf);
-        const res = (await sql`select tid.contest_record_quote(${r.snapshotId}::bigint, now()) as v`)[0].v;
-        filled += res.filled; closed += res.closed;
+        const res = (await sql`select tid.contest_record_quote(${r.snapshotId}::bigint, now(), ${e.next}::date, ${e.checked}::boolean) as v`)[0].v;
+        filled += res.filled; closed += res.closed; rejected += res.rejected_quality;
         const q = r.json?.data ?? {};
         records.push(rec(key("contest_quote", c, session, scan), { purpose: d.purpose, bid: q.bid, ask: q.ask,
           updated_at: q.updated_at, underlying_price: q.underlying_price, snapshot_id: r.snapshotId, result: res },
           c.slice(0, -15), q.updated_at ?? null, r.asOf));
       } catch (e) {
         if (e instanceof QuotaError) throw e;
-        errors.push(`${c}: ${(e as Error).message}`);
+        const msg = (e as Error).message;
+        // Vendor says the contract does not exist: the agent's error, rejected at entry rather than left to time out.
+        if (/HTTP 404/.test(msg) && /not listed|No listed contract|not_found/i.test(msg) && String(d.purpose).includes("entry")) {
+          const n = (await sql`select tid.contest_reject_unlisted(${c}::text, ${msg}::text, now()) as n`)[0].n;
+          rejected += n;
+          records.push(rec(key("contest_quote", c, session, scan), { purpose: d.purpose, unlisted: true, rejected: n }, c.slice(0, -15), null, null));
+          if (!String(d.purpose).includes("mark")) continue;
+        }
+        errors.push(`${c}: ${msg}`);
       }
     }
     return { records, pages, complete: errors.length === 0, more: false, error: summarize(errors), asOf: asOfs.sort().pop() ?? null,
-      meta: { endpoint: "/options/contracts", contracts: due.length, filled, closed, failed: errors.length } };
+      meta: { endpoint: "/options/contracts", contracts: due.length, filled, rejected_quality: rejected, closed, failed: errors.length } };
   };
 }
 
