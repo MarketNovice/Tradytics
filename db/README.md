@@ -9,7 +9,9 @@ Supabase GitHub integration does not pick them up. Apply each one by hand after 
 | `tid-3.3-heartbeat.sql` | **Applied** 2026-11-25 (`tid_3_3_heartbeat`) | TID-3.3: NYSE calendar 2026-2027 (closures, early closes), calendar functions, expected scans with ET deadlines, append-only watchdog log, `tid.hb_check` (reports each finding once), canary and `tid.hb_ack_canary`. |
 | `tid-2.12-open-interest.sql` | **Applied** 2026-11-25 (`tid_2_12_open_interest`) | TID-2.12: OI vintages from chain snapshots (fingerprint per distinct OI set), first-capture timing, session mapping (`baseline`/`overnight`/`evening`/`intraday`), `available_before_open`, contract-level view, `tid.oi_contract_changes`, mapping report. |
 
-Order: 3.2, then 3.3, then 2.12. All three are idempotent.
+| `tid-runner-role.sql` | **Applied** 2026-11-25 (`tid_runner_role`) | Login role `tid_runner` for the runner and watchdog, created without a password. Writes scan runs, ingestion tables and market bars; reads the calendar; executes the TID functions. Cannot delete, read snapshot/version/OI/watchdog tables, or touch other tables. Verified as the role in a rolled-back transaction. |
+
+Order: 3.2, then 3.3, then 2.12, then the role. All are idempotent.
 
 ## TID-2.12 verification (protocol §13)
 
