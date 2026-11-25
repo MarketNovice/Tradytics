@@ -1,0 +1,49 @@
+name: tid-watchdog
+
+# TID-3.3 independent heartbeat. Runs hourly on its own schedule, separate from tid-runner, and alerts
+# (failed run + GitHub issue) when an expected scan is missing or incomplete, or when the check itself
+# cannot reach the database. Run it manually with "canary" ticked to test that alerts reach you.
+on:
+  schedule:
+    - cron: "50 * * * 1-6"
+  workflow_dispatch:
+    inputs:
+      canary:
+        description: Send a test (canary) alert
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: tid-watchdog
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.1.4
+      - name: Check heartbeat
+        env:
+          DATABASE_URL: ${{ secrets.WATCHDOG_DATABASE_URL || secrets.DATABASE_URL }}
+          ALERT_FILE: ${{ runner.temp }}/alert.md
+          WATCHDOG_NAME: github-actions/${{ github.workflow }}
+        run: deno run -A tid-runner/watchdog.ts ${{ inputs.canary && '--canary' || '' }}
+      - name: Open alert issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ALERT_FILE: ${{ runner.temp }}/alert.md
+        run: |
+          [ -s "$ALERT_FILE" ] || echo "## TID watchdog failed before writing an alert. See the run log." > "$ALERT_FILE"
+          title=$(head -1 "$ALERT_FILE" | sed 's/^## //')
+          echo "" >> "$ALERT_FILE"
+          echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> "$ALERT_FILE"
+          gh issue create --repo "${{ github.repository }}" --title "$title" --body-file "$ALERT_FILE"

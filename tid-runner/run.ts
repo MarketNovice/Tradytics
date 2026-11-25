@@ -1,48 +1,71 @@
 // tid-runner/run.ts
 // Deterministic replacement for the chat-based scheduled scans.
-// Calls the Tradytics REST API, writes through your EXISTING ingestion functions
+// Calls the Tradytics REST API, writes through the existing ingestion functions
 // (begin_ingestion_batch / upsert_ingestion_records_bulk / finalize_ingestion_batch),
-// records every raw response with TID-3.2 capture_snapshot when it is installed,
+// records every raw response with TID-3.2 capture_snapshot, records OI vintages (TID-2.12),
 // and verifies each batch by reading it back.
 //
 // Usage:
-//   deno run -A run.ts --scan auto|morning|midday|afternoon [--dry-run] [--force]
+//   deno run -A run.ts --scan morning|midday|afternoon|oi|auto [--window] [--dry-run] [--force]
 //
-// --dry-run needs only TRADYTICS_API_KEY. It fetches, prints counts and one sample
-// record per feed, and writes nothing. Run it first to confirm the endpoint and
-// parameter assumptions marked ASSUMPTION below.
+//   --window   refuse to run outside the scan's ET window (used by the scheduled workflow, so the
+//              cron entry for the other DST offset exits without doing anything)
+//   --dry-run  fetch and print counts and one sample per feed; needs only TRADYTICS_API_KEY; writes nothing
+//   --force    run on weekends/holidays and repeat a scan that already completed today
+//
+// Exit codes: 0 done or expected skip, 1 one or more feeds failed, 2 setup error, 3 aborted on API quota.
 //
 // Env: TRADYTICS_API_KEY (required), DATABASE_URL (required unless --dry-run),
-//      TRADYTICS_BASE_URL, TRADYTICS_RPM (default 8), BARS_FROM (default 2026-08-20),
-//      SNAPSHOTS (default on if tid.capture_snapshot exists)
+//      TRADYTICS_BASE_URL, TRADYTICS_RPM (default 8), BARS_LOOKBACK_DAYS (default 150),
+//      OI_MAX_DTE (default 60), REQUIRE_SNAPSHOTS (default 1; set 0 to allow runs without TID-3.2)
 
 import postgres from "npm:postgres@3.4.4";
 
-type ScanType = "morning" | "midday" | "afternoon";
-const RUNNER_VERSION = "tid-runner/0.1.0";
+type ScanType = "morning" | "midday" | "afternoon" | "oi";
+const SCANS: ScanType[] = ["morning", "midday", "afternoon", "oi"];
+const RUNNER_VERSION = "tid-runner/0.1.1";
 const SOURCE = "Tradytics";
 const BASE = Deno.env.get("TRADYTICS_BASE_URL") ?? "https://tradytics.com/api/public/v1";
-const RPM = Number(Deno.env.get("TRADYTICS_RPM") ?? "8"); // Plus plan is 10/min; Pro 300/min. Set to your plan.
-const BARS_FROM = Deno.env.get("BARS_FROM") ?? "2026-08-20";
+const RPM = Number(Deno.env.get("TRADYTICS_RPM") ?? "8");
+const BARS_LOOKBACK_DAYS = Number(Deno.env.get("BARS_LOOKBACK_DAYS") ?? "150");
+const OI_MAX_DTE = Number(Deno.env.get("OI_MAX_DTE") ?? "60");
+const REQUIRE_SNAPSHOTS = (Deno.env.get("REQUIRE_SNAPSHOTS") ?? "1") !== "0";
 const COHORT_ID = "TID_50_COHORT";
+
+// ET windows [start, end) in minutes after midnight. Morning must finish before the 09:30 open.
+const WINDOWS: Record<ScanType, [number, number]> = {
+  morning: [7 * 60, 9 * 60 + 25],
+  midday: [11 * 60 + 30, 13 * 60 + 45],
+  afternoon: [14 * 60 + 30, 16 * 60],
+  oi: [17 * 60, 23 * 60 + 30],
+};
 
 const UNIVERSE = ("NVDA,MU,SNDK,AMD,TSLA,JNJ,AMZN,AAPL,AVGO,VLO,BA,META,INTC,MSFT,GOOGL,NBIS,CRWD,MSTR,CRWV,RDDT," +
   "DELL,PLTR,ORCL,UNH,GME,BE,LULU,AMAT,NFLX,FSLR,MRVL,COIN,ADBE,MRNA,HOOD,EXE,VSAT,SMCI,LITE,CAT,IREN,JPM,APH," +
   "LRCX,NOW,CMI,GPN,WMT,STX,RIOT").split(",");
-if (UNIVERSE.length !== 50) throw new Error(`universe must be 50 symbols, got ${UNIVERSE.length}`);
 const QUOTE_SET = [...UNIVERSE, "SPY", "QQQ", "IWM"];
+
+// ------------------------------------------------------------------ arguments
+class SetupError extends Error {}
+class QuotaError extends Error {}
 
 const args = Deno.args;
 const DRY = args.includes("--dry-run");
 const FORCE = args.includes("--force");
-const scanArg = (args[args.indexOf("--scan") + 1] ?? "auto") as ScanType | "auto";
+const WINDOW = args.includes("--window");
+function scanArgument(): ScanType | "auto" {
+  const i = args.indexOf("--scan");
+  const v = i >= 0 ? args[i + 1] : undefined;
+  if (!v || v.startsWith("--")) throw new SetupError(`--scan is required: ${[...SCANS, "auto"].join("|")}`);
+  if (v !== "auto" && !SCANS.includes(v as ScanType)) throw new SetupError(`unknown scan "${v}"`);
+  return v as ScanType | "auto";
+}
 
-const KEY = Deno.env.get("TRADYTICS_API_KEY");
-if (!KEY) throw new Error("TRADYTICS_API_KEY is required");
 // deno-lint-ignore no-explicit-any
 let sql: any = null;
 let runId: string | null = null;
 let snapshotsOn = false;
+const snapStats = { stored: 0, failed: 0 };
 
 // ------------------------------------------------------------------ helpers
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -56,10 +79,17 @@ function et(now = new Date()) {
     hour: "2-digit", minute: "2-digit", hourCycle: "h23", weekday: "short",
   }).formatToParts(now);
   const g = (t: string) => p.find((x) => x.type === t)!.value;
-  return { date: `${g("year")}-${g("month")}-${g("day")}`, hour: +g("hour"), minute: +g("minute"), weekday: g("weekday") };
+  return { date: `${g("year")}-${g("month")}-${g("day")}`, minutes: +g("hour") * 60 + +g("minute"), weekday: g("weekday") };
 }
 function addDays(d: string, n: number) {
   const t = new Date(d + "T00:00:00Z"); t.setUTCDate(t.getUTCDate() + n); return t.toISOString().slice(0, 10);
+}
+const hhmm = (m: number) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+
+// Builds a record key and refuses missing parts, so a missing field can never collapse days onto one key.
+function key(...parts: unknown[]): string {
+  for (const p of parts) if (p === undefined || p === null || p === "") throw new Error(`record key part missing in ${JSON.stringify(parts)}`);
+  return parts.join(":");
 }
 
 let lastCall = 0;
@@ -68,50 +98,83 @@ async function throttle() {
   if (wait > 0) await sleep(wait);
   lastCall = Date.now();
 }
+function retryAfterSeconds(h: string | null, fallback: number): number {
+  if (!h) return fallback;
+  const n = Number(h);
+  if (isFinite(n)) return n;
+  const t = Date.parse(h);
+  return isFinite(t) ? Math.max(0, (t - Date.now()) / 1000) : fallback;
+}
 
 // deno-lint-ignore no-explicit-any
 type Json = any;
-interface ApiResult { json: Json; url: string; rawSha: string; asOf: string | null }
+interface ApiResult { json: Json; url: string; rawSha: string; asOf: string | null; snapshotId: number | null }
+interface ApiOpts { project?: (json: Json) => Json }
 
-async function snap(path: string, params: Json, r: ApiResult | null, reason: string | null) {
-  if (!sql || !snapshotsOn) return;
+async function snap(path: string, params: Json, r: ApiResult | null, reason: string | null, receivedAt: string | null, payload?: Json): Promise<number | null> {
+  if (!sql || !snapshotsOn) return null;
   const sym = params.symbol && !String(params.symbol).includes(",") ? String(params.symbol) : null;
   try {
-    await sql`select tid.capture_snapshot(
+    const row = (await sql`select tid.capture_snapshot(
       ${"tradytics" + path}::text, ${sym}::text, null::text, ${sql.json(params)}::jsonb,
-      ${r?.asOf ?? null}::timestamptz, ${r ? sql.json(r.json) : null}::jsonb,
+      ${r?.asOf ?? null}::timestamptz, ${r ? sql.json(payload ?? r.json) : null}::jsonb,
       ${r ? "complete" : "missing"}::text, ${reason}::text, ${r?.rawSha ?? null}::text,
-      ${runId}::uuid, ${RUNNER_VERSION}::text)`;
+      ${runId}::uuid, ${RUNNER_VERSION}::text, ${receivedAt}::timestamptz) as id`)[0];
+    snapStats.stored++;
+    return Number(row.id);
   } catch (e) {
-    console.error("snapshot capture failed:", (e as Error).message);
+    snapStats.failed++;
+    const msg = `snapshot capture failed: ${(e as Error).message}`;
+    console.error(msg);
+    if (REQUIRE_SNAPSHOTS) throw new Error(msg);
+    return null;
   }
 }
 
-async function api(path: string, params: Json, attempt = 0): Promise<ApiResult> {
+async function api(path: string, params: Json, opts: ApiOpts = {}, attempt = 0): Promise<ApiResult> {
+  const clean: Json = {};
+  for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== null) clean[k] = v;
   const url = new URL(BASE + path);
-  for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
+  for (const [k, v] of Object.entries(clean)) url.searchParams.set(k, String(v));
   await throttle();
   let res: Response, text: string;
   try {
-    res = await fetch(url, { headers: { Authorization: `Bearer ${KEY}`, Accept: "application/json" } });
+    res = await fetch(url, { headers: { Authorization: `Bearer ${Deno.env.get("TRADYTICS_API_KEY")}`, Accept: "application/json" } });
     text = await res.text();
   } catch (e) {
-    if (attempt < 2) { await sleep(3000); return api(path, params, attempt + 1); }
-    await snap(path, params, null, `network: ${(e as Error).message}`);
+    if (attempt < 2) { await sleep(3000 * (attempt + 1)); return api(path, params, opts, attempt + 1); }
+    await snap(path, clean, null, `network: ${(e as Error).message}`, new Date().toISOString());
     throw e;
   }
-  if ((res.status === 429 || res.status >= 500) && attempt < 2) {
-    const ra = Number(res.headers.get("retry-after") ?? "5");
-    await sleep(Math.min(isFinite(ra) ? ra : 5, 60) * 1000);
-    return api(path, params, attempt + 1);
+  const receivedAt = new Date().toISOString();
+  if (res.status === 429) {
+    if (/quota_exceeded/i.test(text)) {
+      await snap(path, clean, null, `quota_exceeded: ${text.slice(0, 200)}`, receivedAt);
+      throw new QuotaError(`daily quota exceeded (resets 00:00 UTC): ${text.slice(0, 300)}`);
+    }
+    if (attempt < 3) {
+      const wait = Math.min(retryAfterSeconds(res.headers.get("retry-after"), 10), 120);
+      console.error(`rate limited on ${path}; waiting ${Math.round(wait)}s`);
+      await sleep(wait * 1000);
+      return api(path, params, opts, attempt + 1);
+    }
+  }
+  if (res.status >= 500 && attempt < 2) {
+    await sleep(Math.min(retryAfterSeconds(res.headers.get("retry-after"), 5), 60) * 1000);
+    return api(path, params, opts, attempt + 1);
   }
   if (!res.ok) {
-    await snap(path, params, null, `http ${res.status}: ${text.slice(0, 200)}`);
+    await snap(path, clean, null, `http ${res.status}: ${text.slice(0, 200)}`, receivedAt);
     throw new Error(`${path} -> HTTP ${res.status}: ${text.slice(0, 300)}`);
   }
-  const json = JSON.parse(text);
-  const out = { json, url: url.toString(), rawSha: await sha256(text), asOf: json?.meta?.as_of ?? null };
-  await snap(path, params, out, null);
+  let json: Json;
+  try { json = JSON.parse(text); }
+  catch {
+    await snap(path, clean, null, `non-JSON 200 response: ${text.slice(0, 200)}`, receivedAt);
+    throw new Error(`${path} -> non-JSON 200 response`);
+  }
+  const out: ApiResult = { json, url: url.toString(), rawSha: await sha256(text), asOf: json?.meta?.as_of ?? null, snapshotId: null };
+  out.snapshotId = await snap(path, clean, out, null, receivedAt, opts.project ? opts.project(json) : undefined);
   return out;
 }
 
@@ -126,29 +189,40 @@ function rows(json: Json): Json[] {
   return [];
 }
 
-// Follows next_cursor (ASSUMPTION: the cursor query parameter is named "cursor").
-async function fetchAll(path: string, params: Json, maxPages = 40) {
+// Follows next_cursor via the "cursor" parameter (confirmed in the 2026-11-24 dry run).
+async function fetchAll(path: string, params: Json, opts: ApiOpts = {}, maxPages = 40) {
   const pages: ApiResult[] = [];
   const seen = new Set<string>();
   let cursor: string | undefined, complete = true, more = false, error: string | null = null;
   for (let i = 0; i < maxPages; i++) {
-    const r = await api(path, { ...params, cursor });
+    const r = await api(path, { ...params, cursor }, opts);
     pages.push(r);
     const next = r.json?.next_cursor;
-    if (!next) break;
-    if (seen.has(next)) { complete = false; more = true; error = "repeated cursor detected"; break; }
-    seen.add(next); cursor = next;
+    if (next === null || next === undefined || next === "") break;
+    const nk = String(next);
+    if (seen.has(nk)) { complete = false; more = true; error = "repeated cursor detected"; break; }
+    seen.add(nk); cursor = nk;
     if (i === maxPages - 1) { complete = false; more = true; error = "page cap reached"; }
   }
   return { pages, complete, more, error, all: pages.flatMap((p) => rows(p.json)) };
 }
 
 interface Rec { record_key: string; source_event_key: string; payload: Json; symbol: string | null; source_event_at: string | null; source_as_of: string | null }
-const rec = (key: string, payload: Json, symbol: string | null, at: string | null, asOf: string | null): Rec =>
-  ({ record_key: key, source_event_key: key, payload, symbol, source_event_at: at, source_as_of: asOf });
+const rec = (k: string, payload: Json, symbol: string | null, at: string | null, asOf: string | null): Rec =>
+  ({ record_key: k, source_event_key: k, payload, symbol, source_event_at: at, source_as_of: asOf });
 
 interface Built { records: Rec[]; pages: number; complete: boolean; more: boolean; error: string | null; asOf: string | null; meta: Json; after?: () => Promise<void> }
-interface FeedOutcome { feedType: string; ok: boolean; received: number; error: string | null }
+interface FeedOutcome { feedType: string; ok: boolean; received: number; error: string | null; snapshots_failed?: number }
+const maxAsOf = (a: ApiResult[]) => a.map((p) => p.asOf).filter(Boolean).sort().pop() ?? null;
+
+// Converts rows to records, collecting key errors instead of failing on the first.
+function toRecords(all: Json[], make: (x: Json) => Rec, errors: string[]): Rec[] {
+  const out: Rec[] = [];
+  for (const x of all) {
+    try { out.push(make(x)); } catch (e) { errors.push((e as Error).message); }
+  }
+  return out;
+}
 
 // ------------------------------------------------------------------ persistence
 async function persist(feedType: string, b: Built): Promise<FeedOutcome> {
@@ -177,109 +251,114 @@ async function persist(feedType: string, b: Built): Promise<FeedOutcome> {
   // Readback: never trust the finalize response.
   const bt = (await sql`select status, quality_status, pagination_complete, records_received, records_upserted, error_text
                         from tid.tid_ingestion_batches where batch_id = ${batchId}::uuid`)[0];
-  let linked: number | null = null;
-  try { // ASSUMPTION: tid_ingestion_batch_records has a batch_id column.
-    linked = (await sql`select count(*)::int as n from tid.tid_ingestion_batch_records where batch_id = ${batchId}::uuid`)[0].n;
-  } catch { linked = null; }
-  const ok = bt.status === "complete" && bt.quality_status === "pass" && bt.pagination_complete === true &&
-    (linked === null || linked === bt.records_received);
+  const linked = (await sql`select count(*)::int as n from tid.tid_ingestion_batch_records where batch_id = ${batchId}::uuid`)[0].n;
+  const ok = bt.status === "complete" && bt.quality_status === "pass" && bt.pagination_complete === true && linked === bt.records_received;
   console.log(`${feedType}: status=${bt.status} quality=${bt.quality_status} received=${bt.records_received} ` +
-    `upserted=${bt.records_upserted} linked=${linked ?? "n/a"} ok=${ok}`);
+    `upserted=${bt.records_upserted} linked=${linked} ok=${ok}`);
   return { feedType, ok, received: bt.records_received, error: ok ? null : (bt.error_text ?? err ?? "readback mismatch") };
 }
 
 async function runFeed(feedType: string, build: () => Promise<Built>): Promise<FeedOutcome> {
+  const snapFailedBefore = snapStats.failed;
   let built: Built;
   try { built = await build(); }
   catch (e) {
+    if (e instanceof QuotaError) throw e;
     built = { records: [], pages: 0, complete: false, more: false, error: String((e as Error).message), asOf: null, meta: { failed_before_write: true } };
   }
-  try { return await persist(feedType, built); }
-  catch (e) { return { feedType, ok: false, received: 0, error: `persist failed: ${(e as Error).message}` }; }
+  let out: FeedOutcome;
+  try { out = await persist(feedType, built); }
+  catch (e) { out = { feedType, ok: false, received: 0, error: `persist failed: ${(e as Error).message}` }; }
+  out.snapshots_failed = snapStats.failed - snapFailedBefore;
+  return out;
 }
 
 // ------------------------------------------------------------------ feeds
-const maxAsOf = (a: ApiResult[]) => a.map((p) => p.asOf).filter(Boolean).sort().pop() ?? null;
+// Per-symbol loop used by bars, daily flow and OI. A quota error aborts the whole run.
+async function perSymbol(symbols: string[], each: (sym: string) => Promise<void>, errors: string[]) {
+  for (const sym of symbols) {
+    try { await each(sym); }
+    catch (e) {
+      if (e instanceof QuotaError) throw e;
+      errors.push(`${sym}: ${(e as Error).message}`);
+    }
+  }
+}
+const summarize = (errors: string[]) => errors.length ? `${errors.length} error(s): ${errors.slice(0, 5).join("; ")}` : null;
 
 function quotesFeed(): () => Promise<Built> {
   return async () => {
-    // ASSUMPTION: GET /stocks/quotes accepts a comma-separated symbol list.
     const r = await fetchAll("/stocks/quotes", { symbol: QUOTE_SET.join(",") });
-    const asOf = maxAsOf(r.pages);
-    return {
-      records: r.all.map((q) => rec(`quote:${q.symbol}:${q.price_at}`, q, q.symbol, q.price_at ?? null, asOf)),
-      pages: r.pages.length, complete: r.complete, more: r.more, error: r.error, asOf,
-      meta: { endpoint: "/stocks/quotes", symbols: QUOTE_SET.length },
-    };
+    const asOf = maxAsOf(r.pages); const errors: string[] = r.error ? [r.error] : [];
+    const records = toRecords(r.all, (q) => rec(key("quote", q.symbol, q.price_at), q, q.symbol, q.price_at, asOf), errors);
+    if (records.length !== QUOTE_SET.length) errors.push(`expected ${QUOTE_SET.length} quotes, got ${records.length}`);
+    return { records, pages: r.pages.length, complete: r.complete, more: r.more, error: summarize(errors), asOf,
+      meta: { endpoint: "/stocks/quotes", symbols: QUOTE_SET.length } };
   };
 }
 function marketFeed(path: string, keyFn: (x: Json, asOf: string | null) => string, extra: Json = {}): () => Promise<Built> {
   return async () => {
     const r = await fetchAll(path, extra);
-    const asOf = maxAsOf(r.pages);
-    return {
-      records: r.all.map((x) => rec(keyFn(x, asOf), x, null, x.time ?? x.date ?? asOf, asOf)),
-      pages: r.pages.length, complete: r.complete, more: r.more, error: r.error, asOf, meta: { endpoint: path, ...extra },
-    };
+    const asOf = maxAsOf(r.pages); const errors: string[] = r.error ? [r.error] : [];
+    const records = toRecords(r.all, (x) => rec(keyFn(x, asOf), x, null, x.time ?? x.date ?? asOf, asOf), errors);
+    if (records.length === 0) errors.push("no rows");
+    return { records, pages: r.pages.length, complete: r.complete, more: r.more, error: summarize(errors), asOf, meta: { endpoint: path, ...extra } };
   };
 }
 function cohortFlowFeed(session: string): () => Promise<Built> {
   return async () => {
     // Cohort AGGREGATE. Rows carry no symbol. Never attribute to individual tickers.
     const r = await fetchAll("/options/flow/timeline", { symbol: UNIVERSE.join(","), interval: "15m", date: session });
-    const asOf = maxAsOf(r.pages);
-    return {
-      records: r.all.map((x) => rec(`cohortflow:${COHORT_ID}:${x.time}`, { ...x, cohort: COHORT_ID, members: UNIVERSE }, COHORT_ID, x.time ?? null, asOf)),
-      pages: r.pages.length, complete: r.complete, more: r.more, error: r.error, asOf,
-      meta: { endpoint: "/options/flow/timeline", interval: "15m", date: session, aggregate: true, cohort: COHORT_ID },
-    };
+    const asOf = maxAsOf(r.pages); const errors: string[] = r.error ? [r.error] : [];
+    const records = toRecords(r.all, (x) => rec(key("cohortflow", COHORT_ID, x.time), { ...x, cohort: COHORT_ID, members: UNIVERSE }, COHORT_ID, x.time, asOf), errors);
+    return { records, pages: r.pages.length, complete: r.complete, more: r.more, error: summarize(errors), asOf,
+      meta: { endpoint: "/options/flow/timeline", interval: "15m", date: session, aggregate: true, cohort: COHORT_ID } };
   };
 }
 function symbolFlowFeed(session: string): () => Promise<Built> {
   return async () => {
-    const records: Rec[] = []; const missing: string[] = []; let pages = 0, complete = true, more = false;
-    const errors: string[] = []; const asOfs: string[] = [];
-    for (const sym of UNIVERSE) {
-      try {
-        const r = await fetchAll("/options/flow/timeline", { symbol: sym, interval: "1d", from: addDays(session, -60), to: session });
-        pages += r.pages.length; complete &&= r.complete; more ||= r.more;
-        if (r.error) errors.push(`${sym}: ${r.error}`);
-        const a = maxAsOf(r.pages); if (a) asOfs.push(a);
-        if (r.all.length === 0) {
-          missing.push(sym); // explicit empty-feed status, never imputed as zero
-          records.push(rec(`flow1d:${sym}:EMPTY:${session}`, { status: "empty_feed", session }, sym, null, a));
-        }
-        for (const x of r.all) records.push(rec(`flow1d:${sym}:${x.date ?? x.time}`, x, sym, x.time ?? null, a));
-      } catch (e) { complete = false; errors.push(`${sym}: ${(e as Error).message}`); }
-    }
-    return { records, pages, complete, more, error: errors.length ? errors.slice(0, 5).join("; ") : null,
-      asOf: asOfs.sort().pop() ?? null, meta: { endpoint: "/options/flow/timeline", interval: "1d", empty_symbols: missing, failed: errors.length } };
+    const records: Rec[] = []; const empty: string[] = []; const errors: string[] = []; const asOfs: string[] = [];
+    let pages = 0, complete = true, more = false;
+    await perSymbol(UNIVERSE, async (sym) => {
+      const r = await fetchAll("/options/flow/timeline", { symbol: sym, interval: "1d", from: addDays(session, -60), to: session });
+      pages += r.pages.length; complete &&= r.complete; more ||= r.more;
+      if (r.error) errors.push(`${sym}: ${r.error}`);
+      const a = maxAsOf(r.pages); if (a) asOfs.push(a);
+      if (r.all.length === 0) {
+        empty.push(sym); // explicit empty-feed status, never imputed as zero
+        records.push(rec(key("flow1d", sym, "EMPTY", session), { status: "empty_feed", session }, sym, null, a));
+      }
+      records.push(...toRecords(r.all, (x) => rec(key("flow1d", sym, x.date ?? x.time), x, sym, x.time ?? null, a), errors));
+    }, errors);
+    if (errors.length) complete = false;
+    return { records, pages, complete, more, error: summarize(errors), asOf: asOfs.sort().pop() ?? null,
+      meta: { endpoint: "/options/flow/timeline", interval: "1d", empty_symbols: empty, failed: errors.length } };
   };
 }
 function barsFeed(session: string): () => Promise<Built> {
   return async () => {
-    const now = et();
-    const done = (d: string) => d < now.date || (d === now.date && (now.hour > 16 || (now.hour === 16 && now.minute >= 30)));
-    const records: Rec[] = []; const bars: Json[] = []; let pages = 0, complete = true, more = false;
-    const errors: string[] = []; const asOfs: string[] = [];
-    for (const sym of [...UNIVERSE, "SPY"]) {
-      try {
-        const r = await fetchAll("/stocks/bars", { symbol: sym, timeframe: "1d", from: BARS_FROM, to: session, limit: 100 });
-        pages += r.pages.length; complete &&= r.complete; more ||= r.more;
-        if (r.error) errors.push(`${sym}: ${r.error}`);
-        const a = maxAsOf(r.pages); if (a) asOfs.push(a);
-        for (const x of r.all) {
-          const d = String(x.time).slice(0, 10);
-          if (!done(d)) continue; // exclude the forming bar
-          records.push(rec(`bars1d:${sym}:${d}`, x, sym, x.time, a));
-          bars.push({ symbol: sym, session_date: d, open: x.open, high: x.high, low: x.low, close: x.close, volume: x.volume, source_as_of: a });
-        }
-      } catch (e) { complete = false; errors.push(`${sym}: ${(e as Error).message}`); }
-    }
+    const today = et().date;
+    const from = addDays(session, -BARS_LOOKBACK_DAYS);
+    const records: Rec[] = []; const bars: Json[] = []; const errors: string[] = []; const asOfs: string[] = [];
+    let pages = 0, complete = true, more = false;
+    await perSymbol([...UNIVERSE, "SPY"], async (sym) => {
+      const r = await fetchAll("/stocks/bars", { symbol: sym, timeframe: "1d", from, to: session, limit: 100 });
+      pages += r.pages.length; complete &&= r.complete; more ||= r.more;
+      if (r.error) errors.push(`${sym}: ${r.error}`);
+      const a = maxAsOf(r.pages); if (a) asOfs.push(a);
+      for (const x of r.all) {
+        const d = String(x.time ?? "").slice(0, 10);
+        // Only sessions before today: the vendor still revises the current day's bar hours after the close.
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(d) || d >= today) continue;
+        records.push(rec(key("bars1d", sym, d), x, sym, x.time, a));
+        bars.push({ symbol: sym, session_date: d, open: x.open, high: x.high, low: x.low, close: x.close, volume: x.volume, source_as_of: a });
+      }
+    }, errors);
+    if (errors.length) complete = false;
     return {
-      records, pages, complete, more, error: errors.length ? errors.slice(0, 5).join("; ") : null,
-      asOf: asOfs.sort().pop() ?? null, meta: { endpoint: "/stocks/bars", timeframe: "1d", from: BARS_FROM, to: session, failed: errors.length },
-      after: async () => { // columns per the stored morning prompt; upsert only when incoming source_as_of is not older
+      records, pages, complete, more, error: summarize(errors), asOf: asOfs.sort().pop() ?? null,
+      meta: { endpoint: "/stocks/bars", timeframe: "1d", from, to: session, failed: errors.length },
+      after: async () => {
         if (!sql || bars.length === 0) return;
         await sql`insert into tid.tid_market_bars (symbol, session_date, timeframe, open, high, low, close, volume, source, source_as_of)
           select x->>'symbol', (x->>'session_date')::date, '1d', (x->>'open')::numeric, (x->>'high')::numeric,
@@ -294,68 +373,151 @@ function barsFeed(session: string): () => Promise<Built> {
   };
 }
 
+// TID-2.12: per-contract OI chain. Each page is stored as a 'chain_oi_v1' projection snapshot, then
+// tid.record_oi_capture turns the symbol's pages into an OI vintage (new or repeat).
+const projectChain = (json: Json) => ({
+  projection: "chain_oi_v1",
+  columns: ["contract", "open_interest", "volume", "delta"],
+  rows: rows(json).map((r) => [r.contract, r.open_interest, r.volume, r.delta]),
+  meta: json?.meta ?? null,
+  next_cursor: json?.next_cursor ?? null,
+});
+function oiFeed(session: string, scan: ScanType): () => Promise<Built> {
+  return async () => {
+    if (!DRY && !snapshotsOn) throw new Error("OI capture requires TID-3.2 snapshots");
+    const records: Rec[] = []; const errors: string[] = []; const asOfs: string[] = [];
+    let pages = 0, complete = true, more = false, newVintages = 0;
+    await perSymbol(UNIVERSE, async (sym) => {
+      const r = await fetchAll("/options/chain", { symbol: sym, limit: 1000, max_dte: OI_MAX_DTE }, { project: projectChain });
+      pages += r.pages.length; complete &&= r.complete; more ||= r.more;
+      if (r.error) throw new Error(r.error);
+      const a = maxAsOf(r.pages); if (a) asOfs.push(a);
+      const bad = r.all.filter((x) => typeof x.contract !== "string" || typeof x.open_interest !== "number").length;
+      if (bad) throw new Error(`${bad} chain rows lack contract or open_interest`);
+      if (r.all.length === 0) throw new Error("empty chain");
+      const calls = r.all.filter((x) => x.type === "call"), puts = r.all.filter((x) => x.type === "put");
+      const summary: Json = {
+        session, scan, contracts: r.all.length, nonzero_oi: r.all.filter((x) => x.open_interest > 0).length,
+        call_oi: calls.reduce((s, x) => s + x.open_interest, 0), put_oi: puts.reduce((s, x) => s + x.open_interest, 0),
+        max_dte: OI_MAX_DTE, pages: r.pages.length, snapshot_ids: r.pages.map((p) => p.snapshotId),
+      };
+      if (sql) {
+        const v = (await sql`select tid.record_oi_capture(${sym}::text, ${r.pages.map((p) => p.snapshotId)}::bigint[], ${runId}::uuid) as v`)[0].v;
+        summary.vintage = v; if (v.new) newVintages++;
+      }
+      records.push(rec(key("oi_chain", sym, session, scan), summary, sym, null, a));
+    }, errors);
+    if (errors.length) complete = false;
+    return { records, pages, complete, more, error: summarize(errors), asOf: asOfs.sort().pop() ?? null,
+      meta: { endpoint: "/options/chain", max_dte: OI_MAX_DTE, projection: "chain_oi_v1", new_vintages: newVintages, failed: errors.length } };
+  };
+}
+
+function feedsFor(scan: ScanType, session: string): [string, () => Promise<Built>][] {
+  const market: [string, () => Promise<Built>][] = [
+    ["tradytics_symbol_quotes", quotesFeed()],
+    ["tradytics_market_indices", marketFeed("/market/indices", (x) => key("index", x.symbol, x.time))],
+    ["tradytics_market_breadth", marketFeed("/market/breadth", (_x, a) => key("breadth", a))],
+    ["tradytics_sector_snapshot", marketFeed("/market/sectors", (x) => key("sector", x.etf ?? x.name, x.date), { type: "sector" })],
+  ];
+  switch (scan) {
+    case "morning": return [
+      ["tradytics_open_interest_chain", oiFeed(session, scan)], // first: OI must be captured before the open
+      ["tradytics_daily_bars", barsFeed(session)],
+      ["tradytics_symbol_flow_1d", symbolFlowFeed(session)],
+      ...market,
+    ];
+    case "midday": case "afternoon": return [...market, ["tradytics_options_flow_timeline", cohortFlowFeed(session)]];
+    case "oi": return [["tradytics_open_interest_chain", oiFeed(session, scan)]];
+  }
+}
+
 // ------------------------------------------------------------------ main
-async function main() {
+async function main(): Promise<number> {
+  if (UNIVERSE.length !== 50) throw new SetupError(`universe must be 50 symbols, got ${UNIVERSE.length}`);
+  if (!Deno.env.get("TRADYTICS_API_KEY")) throw new SetupError("TRADYTICS_API_KEY is required");
+  if (!DRY && !Deno.env.get("DATABASE_URL")) throw new SetupError("DATABASE_URL is required (or use --dry-run)");
+  const requested = scanArgument();
   const now = et();
+  const inWindow = (s: ScanType) => now.minutes >= WINDOWS[s][0] && now.minutes < WINDOWS[s][1];
+
   let scan: ScanType;
-  if (scanArg === "auto") {
-    const map: Record<number, ScanType> = { 6: "morning", 12: "midday", 15: "afternoon" };
-    if (!map[now.hour] && !FORCE) { console.log(`ET hour ${now.hour}: no scan scheduled; exiting.`); return 0; }
-    scan = map[now.hour] ?? "morning";
-  } else scan = scanArg;
-  if ((now.weekday === "Sat" || now.weekday === "Sun") && !FORCE) { console.log("Weekend; exiting."); return 0; }
+  if (requested === "auto") {
+    const s = SCANS.find(inWindow);
+    if (!s) { console.log(`ET ${hhmm(now.minutes)}: no scan window open; nothing to do.`); return 0; }
+    scan = s;
+  } else scan = requested;
+  if (WINDOW && !inWindow(scan)) {
+    console.log(`ET ${hhmm(now.minutes)} is outside the ${scan} window ${hhmm(WINDOWS[scan][0])}-${hhmm(WINDOWS[scan][1])}; skipping.`);
+    return 0;
+  }
   const session = now.date;
+  if ((now.weekday === "Sat" || now.weekday === "Sun") && !FORCE) { console.log("Weekend; exiting."); return 0; }
 
   if (!DRY) {
     sql = postgres(Deno.env.get("DATABASE_URL")!, { max: 2, prepare: false, onnotice: () => {} });
-    try {
-      if ((await sql`select 1 from tid.tid_hb_calendar_exceptions where exception_date = ${session}::date`).length && !FORCE) {
-        console.log("Calendar exception (holiday); exiting."); await sql.end(); return 0;
-      }
-    } catch { /* heartbeat tables not installed yet */ }
-    if (!FORCE) {
-      const dup = await sql`select run_id from tid.tid_scan_runs
-        where run_metadata->>'runner' = 'tid-runner' and run_metadata->>'scan_type' = ${scan}
-          and market_session = ${session}::date and ledger_write_status in ('written','pending') limit 1`;
-      if (dup.length) { console.log(`A ${scan} run already exists for ${session} (${dup[0].run_id}); use --force to repeat.`); await sql.end(); return 0; }
+    if (!FORCE && (await sql`select tid.is_trading_day(${session}::date) as t`)[0].t === false) {
+      console.log(`${session} is a market holiday; exiting.`); return 0;
     }
-    snapshotsOn = Deno.env.get("SNAPSHOTS") !== "0" &&
-      (await sql`select to_regproc('tid.capture_snapshot') as f`)[0].f !== null;
+    // Runs that never finished (process killed) would otherwise sit at 'pending' forever.
+    await sql`update tid.tid_scan_runs set ledger_write_status = 'abandoned'
+      where run_metadata->>'runner' = 'tid-runner' and ledger_write_status = 'pending'
+        and run_completed_at is null and run_started_at < now() - interval '2 hours'`;
+    if (!FORCE) {
+      const done = await sql`select run_id from tid.tid_scan_runs
+        where run_metadata->>'runner' = 'tid-runner' and run_metadata->>'scan_type' = ${scan}
+          and market_session = ${session}::date and ledger_write_status in ('written', 'complete') limit 1`;
+      if (done.length) { console.log(`A completed ${scan} run already exists for ${session} (${done[0].run_id}); use --force to repeat.`); return 0; }
+    }
+    snapshotsOn = (await sql`select to_regproc('tid.capture_snapshot') as f`)[0].f !== null;
+    if (!snapshotsOn && REQUIRE_SNAPSHOTS) throw new SetupError("tid.capture_snapshot is not installed (TID-3.2); set REQUIRE_SNAPSHOTS=0 to run without it");
     runId = (await sql`insert into tid.tid_scan_runs (scan_name, market_session, universe_definition, universe_rows, run_metadata)
       values (${`TID ${scan} scheduled (tid-runner)`}, ${session}::date,
               'TID selected 50-symbol cohort; index membership unverified', 50,
-              ${sql.json({ runner: "tid-runner", runner_version: RUNNER_VERSION, scan_type: scan, snapshots: snapshotsOn })}::jsonb)
+              ${sql.json({ runner: "tid-runner", runner_version: RUNNER_VERSION, scan_type: scan, snapshots: snapshotsOn,
+                           oi_max_dte: OI_MAX_DTE, rpm: RPM })}::jsonb)
       returning run_id`)[0].run_id;
     console.log(`scan_run ${runId} (${scan}, session ${session}, snapshots=${snapshotsOn})`);
   }
 
+  const feeds = feedsFor(scan, session);
   const out: FeedOutcome[] = [];
-  const feed = async (t: string, b: () => Promise<Built>) => { out.push(await runFeed(t, b)); };
-
-  if (scan === "morning") await feed("tradytics_daily_bars", barsFeed(session));
-  if (scan === "morning") await feed("tradytics_symbol_flow_1d", symbolFlowFeed(session));
-  await feed("tradytics_symbol_quotes", quotesFeed());
-  await feed("tradytics_market_indices", marketFeed("/market/indices", (x) => `index:${x.symbol}:${x.time}`));
-  await feed("tradytics_market_breadth", marketFeed("/market/breadth", (_x, a) => `breadth:${a}`));
-  await feed("tradytics_sector_snapshot", marketFeed("/market/sectors", (x) => `sector:${x.etf ?? x.name}:${x.date}`, { type: "sector" }));
-  if (scan !== "morning") await feed("tradytics_options_flow_timeline", cohortFlowFeed(session));
+  let quotaError: string | null = null;
+  for (const [t, b] of feeds) {
+    if (quotaError) { out.push({ feedType: t, ok: false, received: 0, error: "not attempted: quota exceeded" }); continue; }
+    try { out.push(await runFeed(t, b)); }
+    catch (e) {
+      if (!(e instanceof QuotaError)) throw e;
+      quotaError = e.message;
+      out.push({ feedType: t, ok: false, received: 0, error: e.message });
+      console.error(`ABORTING: ${e.message}`);
+    }
+  }
 
   const okN = out.filter((f) => f.ok).length;
   const allOk = okN === out.length;
-  console.log(`\nSUMMARY ${scan} ${session}: ${okN}/${out.length} feeds ok`);
+  console.log(`\nSUMMARY ${scan} ${session}: ${okN}/${out.length} feeds ok; snapshots stored=${snapStats.stored} failed=${snapStats.failed}`);
   for (const f of out) if (!f.ok) console.log(`  FAILED ${f.feedType}: ${f.error}`);
 
   if (!DRY && sql) {
     const ledger = allOk ? "written" : okN > 0 ? "partial" : "not_written";
     await sql`update tid.tid_scan_runs set run_completed_at = now(),
       coverage_pct = ${(100 * okN) / out.length}::numeric, pagination_complete = ${allOk}::boolean,
-      ledger_write_status = ${ledger}::text, data_quality = ${sql.json({ feeds: out })}::jsonb
+      ledger_write_status = ${ledger}::text,
+      data_quality = ${sql.json({ feeds: out, snapshots: snapStats, quota_aborted: quotaError })}::jsonb
       where run_id = ${runId}::uuid`;
     const back = (await sql`select ledger_write_status, run_completed_at from tid.tid_scan_runs where run_id = ${runId}::uuid`)[0];
     console.log(`scan_run readback: ledger=${back.ledger_write_status} completed=${back.run_completed_at}`);
-    await sql.end();
   }
-  return allOk ? 0 : 1;
+  return quotaError ? 3 : allOk ? 0 : 1;
 }
 
-Deno.exit(await main());
+let code: number;
+try { code = await main(); }
+catch (e) {
+  console.error(`${e instanceof SetupError ? "SETUP ERROR" : "ERROR"}: ${(e as Error).message}`);
+  code = e instanceof SetupError ? 2 : 1;
+} finally {
+  if (sql) await sql.end({ timeout: 5 });
+}
+Deno.exit(code!);
