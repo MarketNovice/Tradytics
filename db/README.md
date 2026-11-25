@@ -16,7 +16,13 @@ Supabase GitHub integration does not pick them up. Apply each one by hand after 
 
 | `tid-4.1-contest-quality.sql` | **Applied** 2026-11-25 (`tid_4_1_contest_quality`) | Contract-quality checks at entry (spread ≤ 15%, OI ≥ 500, |delta| 0.30-0.65, no earnings before planned exit, unlisted contracts), reasons recorded, `rejected_quality` on the scoreboard. Tests: `test/test-tid-4.1-quality.sql` (3 of 3; 4.0 suite still 5 of 5). |
 
-Order: 3.2, 3.3, 2.12, runner role, 4.0, 4.1. All are idempotent.
+| `tid-4.2-contest-gateway.sql` | **Applied** 2026-11-25 (`tid_4_2_contest_gateway`) | Agent tokens (only SHA-256 stored; `contest_issue_token`, `contest_revoke_tokens`) and `contest_gateway`, the single entry point for the `contest-submit` Edge Function (`edge/contest-submit/index.ts`, deployed with its own token auth). |
+
+Order: 3.2, 3.3, 2.12, runner role, 4.0, 4.1, 4.2. All are idempotent.
+
+Edge Function `contest-submit` (source `edge/contest-submit/index.ts`): tested locally against the replica
+(auth, live pre-check rejections for delta and unlisted contracts, rule errors, per-agent privacy, revoked
+tokens) and smoke-tested live from the database with a temporary token that was then revoked.
 
 Contest tests: `test/test-tid-4.0-contest.sql` (5 of 5 passed on a fresh database). A live run of the
 `contest1` scan against a local database filled two real contracts at the ask from the first capture and
